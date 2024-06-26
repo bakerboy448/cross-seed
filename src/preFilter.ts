@@ -1,12 +1,19 @@
 import ms from "ms";
 import { extname } from "path";
-import { EP_REGEX, SEASON_REGEX, VIDEO_EXTENSIONS } from "./constants.js";
+import { statSync } from "fs";
+import {
+	ARR_DIR_REGEX,
+	EP_REGEX,
+	SEASON_REGEX,
+	VIDEO_EXTENSIONS,
+} from "./constants.js";
 import { db } from "./db.js";
 import { getEnabledIndexers } from "./indexers.js";
 import { Label, logger } from "./logger.js";
 import { getRuntimeConfig } from "./runtimeConfig.js";
 import { Searchee } from "./searchee.js";
-import { humanReadableDate, nMsAgo } from "./utils.js";
+import { indexerDoesSupportMediaType } from "./torznab.js";
+import { getMediaType, humanReadableDate, nMsAgo } from "./utils.js";
 import path from "path";
 
 export function filterByContent(searchee: Searchee): boolean {
@@ -29,8 +36,6 @@ export function filterByContent(searchee: Searchee): boolean {
 		return false;
 	}
 
-	const isSingleEpisodeTorrent =
-		searchee.files.length === 1 && EP_REGEX.test(searchee.name);
 	const isSeasonPackEpisode =
 		searchee.path &&
 		searchee.files.length === 1 &&
@@ -39,8 +44,8 @@ export function filterByContent(searchee: Searchee): boolean {
 	if (
 		!includeEpisodes &&
 		!includeSingleEpisodes &&
-		isSingleEpisodeTorrent &&
-		!isSeasonPackEpisode
+		!isSeasonPackEpisode &&
+		EP_REGEX.test(searchee.name)
 	) {
 		logReason("it is a single episode");
 		return false;
@@ -58,7 +63,14 @@ export function filterByContent(searchee: Searchee): boolean {
 		logReason("not all files are videos");
 		return false;
 	}
-
+	if (
+		searchee.path &&
+		statSync(searchee.path).isDirectory() &&
+		ARR_DIR_REGEX.test(path.basename(searchee.path))
+	) {
+		logReason("it is a arr movie/series directory");
+		return false;
+	}
 	return true;
 }
 
@@ -104,6 +116,7 @@ type TimestampDataSql = {
 export async function filterTimestamps(searchee: Searchee): Promise<boolean> {
 	const { excludeOlder, excludeRecentSearch } = getRuntimeConfig();
 	const enabledIndexers = await getEnabledIndexers();
+	const mediaType = getMediaType(searchee);
 	const timestampDataSql: TimestampDataSql = (await db("searchee")
 		// @ts-expect-error crossJoin supports string
 		.crossJoin("indexer")
@@ -114,7 +127,14 @@ export async function filterTimestamps(searchee: Searchee): Promise<boolean> {
 		.where("searchee.name", searchee.name)
 		.whereIn(
 			"indexer.id",
-			enabledIndexers.map((i) => i.id),
+			enabledIndexers
+				.filter((indexer) =>
+					indexerDoesSupportMediaType(
+						mediaType,
+						JSON.parse(indexer.categories),
+					),
+				)
+				.map((indexer) => indexer.id),
 		)
 		.min({
 			first_searched_any: db.raw(

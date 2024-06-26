@@ -1,7 +1,6 @@
 import { readdirSync, statSync } from "fs";
-import { basename, extname, join, relative } from "path";
-import { VIDEO_EXTENSIONS } from "./constants.js";
-import { logger } from "./logger.js";
+import { basename, join, relative } from "path";
+import { Label, logger } from "./logger.js";
 import { Metafile } from "./parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "./Result.js";
 import { parseTorrentFromFilename } from "./torrent.js";
@@ -13,6 +12,12 @@ export interface File {
 	path: string;
 }
 
+export type SearcheeLabel =
+	| Label.SEARCH
+	| Label.RSS
+	| Label.ANNOUNCE
+	| Label.WEBHOOK;
+
 export interface Searchee {
 	// if searchee is torrent based
 	infoHash?: string;
@@ -21,6 +26,7 @@ export interface Searchee {
 	files: File[];
 	name: string;
 	length: number;
+	label?: SearcheeLabel;
 }
 
 export type SearcheeWithInfoHash = WithRequired<Searchee, "infoHash">;
@@ -31,10 +37,20 @@ export function hasInfoHash(
 	return searchee.infoHash != null;
 }
 
-export function hasVideo(searchee: Searchee): boolean {
-	return searchee.files.some((file) =>
-		VIDEO_EXTENSIONS.includes(extname(file.name)),
-	);
+enum SearcheeSource {
+	TORRENT = "torrentDir",
+	DATA = "dataDir",
+	VIRTUAL = "virtual",
+}
+
+export function getSearcheeSource(searchee: Searchee): SearcheeSource {
+	if (searchee.infoHash) {
+		return SearcheeSource.TORRENT;
+	} else if (searchee.path) {
+		return SearcheeSource.DATA;
+	} else {
+		return SearcheeSource.VIRTUAL;
+	}
 }
 
 function getFileNamesFromRootRec(root: string, isDirHint?: boolean): string[] {
@@ -86,12 +102,16 @@ export async function createSearcheeFromTorrentFile(
 export async function createSearcheeFromPath(
 	filepath: string,
 ): Promise<Result<Searchee, Error>> {
-	const totalLength = getFilesFromDataRoot(filepath).reduce<number>(
+	const files = getFilesFromDataRoot(filepath);
+	if (files.length === 0) {
+		return resultOfErr(new Error("No files found"));
+	}
+	const totalLength = files.reduce<number>(
 		(runningTotal, file) => runningTotal + file.length,
 		0,
 	);
 	return resultOf({
-		files: getFilesFromDataRoot(filepath),
+		files: files,
 		path: filepath,
 		name: basename(filepath),
 		length: totalLength,

@@ -1,9 +1,21 @@
 import ms from "ms";
 import xml2js from "xml2js";
-import { EP_REGEX, SEASON_REGEX, USER_AGENT } from "./constants.js";
+import {
+	scanAllArrsForMedia,
+	getRelevantArrIds,
+	ParsedMedia,
+	formatFoundIds,
+} from "./arr.js";
+import {
+	EP_REGEX,
+	SEASON_REGEX,
+	UNKNOWN_TRACKER,
+	USER_AGENT,
+} from "./constants.js";
 import { db } from "./db.js";
 import { CrossSeedError } from "./errors.js";
 import {
+	getAllIndexers,
 	getEnabledIndexers,
 	Indexer,
 	IndexerStatus,
@@ -12,18 +24,40 @@ import {
 import { Label, logger } from "./logger.js";
 import { Candidate } from "./pipeline.js";
 import { getRuntimeConfig } from "./runtimeConfig.js";
-import { Searchee, hasVideo } from "./searchee.js";
+import { Searchee } from "./searchee.js";
 import {
-	getAnimeQueries,
 	cleanseSeparators,
-	getTag,
+	extractInt,
+	formatAsList,
+	getAnimeQueries,
+	getApikey,
+	getLogString,
+	getMediaType,
+	isTruthy,
 	MediaType,
 	nMsAgo,
 	reformatTitleForSearching,
+	sanitizeUrl,
 	stripExtension,
 } from "./utils.js";
+import chalk from "chalk";
 
-interface TorznabParams {
+export interface TorznabCats {
+	tv: boolean;
+	movie: boolean;
+	anime: boolean;
+	audio: boolean;
+	book: boolean;
+}
+
+export interface IdSearchParams {
+	tvdbid?: string;
+	tmdbid?: string;
+	imdbid?: string;
+	tvmazeid?: string;
+}
+
+export interface TorznabParams extends IdSearchParams {
 	t: "caps" | "search" | "tvsearch" | "movie";
 	q?: string;
 	limit?: number;
@@ -32,17 +66,31 @@ interface TorznabParams {
 	ep?: number | string;
 }
 
-interface Caps {
-	search: boolean;
-	tvSearch: boolean;
-	movieSearch: boolean;
+export interface IdSearchCaps {
+	tvdbId?: boolean;
+	tmdbId?: boolean;
+	imdbId?: boolean;
+	tvMazeId?: boolean;
 }
 
-type TorznabSearchTechnique = [] | [{ $?: { available: "yes" | "no" } }];
+export interface Caps {
+	search: boolean;
+	categories: TorznabCats;
+	tvSearch: boolean;
+	movieSearch: boolean;
+	movieIdSearch: IdSearchCaps;
+	tvIdSearch: IdSearchCaps;
+}
 
+type TorznabSearchTechnique =
+	| []
+	| [{ $: { available: "yes" | "no"; supportedParams: string } }];
+
+type CategoryXmlElement = { $: { id: string; name: string } };
 type TorznabCaps = {
 	caps?: {
-		searching?: [
+		categories: { category: CategoryXmlElement[] }[];
+		searching: [
 			{
 				search?: TorznabSearchTechnique;
 				"tv-search"?: TorznabSearchTechnique;
@@ -65,17 +113,6 @@ interface TorznabResult {
 
 type TorznabResults = { rss?: { channel?: [] | [{ item?: TorznabResult[] }] } };
 
-function sanitizeUrl(url: string | URL): string {
-	if (typeof url === "string") {
-		url = new URL(url);
-	}
-	return url.origin + url.pathname;
-}
-
-function getApikey(url: string) {
-	return new URL(url).searchParams.get("apikey");
-}
-
 function parseTorznabResults(xml: TorznabResults): Candidate[] {
 	const items = xml?.rss?.channel?.[0]?.item;
 	if (!items || !Array.isArray(items)) {
@@ -89,7 +126,7 @@ function parseTorznabResults(xml: TorznabResults): Candidate[] {
 			item?.prowlarrindexer?.[0]?._ ??
 			item?.jackettindexer?.[0]?._ ??
 			item?.indexer?.[0]?._ ??
-			"Unknown tracker",
+			UNKNOWN_TRACKER,
 		link: item.link[0],
 		size: Number(item.size[0]),
 		pubDate: new Date(item.pubDate[0]).getTime(),
@@ -97,51 +134,115 @@ function parseTorznabResults(xml: TorznabResults): Candidate[] {
 }
 
 function parseTorznabCaps(xml: TorznabCaps): Caps {
-	const capsSection = xml?.caps?.searching?.[0];
-	const isAvailable = (searchTechnique) =>
+	const searchingSection = xml?.caps?.searching?.[0];
+	const isAvailable = (searchTechnique: TorznabSearchTechnique | undefined) =>
 		searchTechnique?.[0]?.$?.available === "yes";
+
+	function getSupportedIds(
+		searchTechnique: TorznabSearchTechnique | undefined,
+	): IdSearchCaps {
+		const supportedParamsStr = searchTechnique?.[0]?.$?.supportedParams;
+		const supportedIds =
+			supportedParamsStr
+				?.split(",")
+				?.filter((token) => token.includes("id")) ?? [];
+
+		return {
+			tvdbId: supportedIds.includes("tvdbid"),
+			tmdbId: supportedIds.includes("tmdbid"),
+			imdbId: supportedIds.includes("imdbid"),
+			tvMazeId: supportedIds.includes("tvmazeid"),
+		};
+	}
+
+	const categoryCaps = xml?.caps?.categories?.[0]?.category;
+
+	function getCatCaps(item: CategoryXmlElement[] | undefined) {
+		const categoryNames: string[] = (item ?? []).map(
+			(category) => category.$.name,
+		);
+
+		function indexerDoesSupportCat(category: string): boolean {
+			return categoryNames.some((cat) =>
+				cat.toLowerCase().includes(category),
+			);
+		}
+		return {
+			movie: indexerDoesSupportCat("movie"),
+			tv: indexerDoesSupportCat("tv"),
+			anime: indexerDoesSupportCat("anime"),
+			audio: indexerDoesSupportCat("audio"),
+			book: indexerDoesSupportCat("book"),
+		};
+	}
+
 	return {
-		search: Boolean(isAvailable(capsSection?.search)),
-		tvSearch: Boolean(isAvailable(capsSection?.["tv-search"])),
-		movieSearch: Boolean(isAvailable(capsSection?.["movie-search"])),
+		search: Boolean(isAvailable(searchingSection?.search)),
+		tvSearch: Boolean(isAvailable(searchingSection?.["tv-search"])),
+		movieSearch: Boolean(isAvailable(searchingSection?.["movie-search"])),
+		movieIdSearch: getSupportedIds(searchingSection?.["movie-search"]),
+		tvIdSearch: getSupportedIds(searchingSection?.["tv-search"]),
+		categories: getCatCaps(categoryCaps),
 	};
 }
 
-function createTorznabSearchQueries(
+async function createTorznabSearchQueries(
 	searchee: Searchee,
+	mediaType: MediaType,
 	caps: Caps,
-): TorznabParams[] {
-	const nameWithoutExtension = stripExtension(searchee.name);
-	const isVideo = hasVideo(searchee);
-	const extractNumber = (str: string): number =>
-		parseInt(str.match(/\d+/)![0]);
-	const mediaType = getTag(nameWithoutExtension, isVideo);
+	parsedMedia?: ParsedMedia,
+): Promise<TorznabParams[]> {
+	const stem = stripExtension(searchee.name);
+	let relevantIds: IdSearchParams = {};
+	if (parsedMedia) {
+		relevantIds = await getRelevantArrIds(caps, parsedMedia);
+	}
+	const useIds = Object.values(relevantIds).some(isTruthy);
 	if (mediaType === MediaType.EPISODE && caps.tvSearch) {
-		const match = nameWithoutExtension.match(EP_REGEX);
+		const match = stem.match(EP_REGEX);
+		const groups = match!.groups!;
 		return [
 			{
 				t: "tvsearch",
-				q: cleanseSeparators(match!.groups!.title),
-				season: match!.groups!.season
-					? extractNumber(match!.groups!.season)
-					: match!.groups!.year,
-				ep: match!.groups!.episode
-					? extractNumber(match!.groups!.episode)
-					: `${match!.groups!.month}/${match!.groups!.day}`,
+				q: useIds ? undefined : cleanseSeparators(groups.title),
+				season: groups.season ? extractInt(groups.season) : groups.year,
+				ep: groups.episode
+					? extractInt(groups.episode)
+					: `${groups.month}/${groups.day}`,
+				...relevantIds,
 			},
 		] as const;
 	} else if (mediaType === MediaType.SEASON && caps.tvSearch) {
-		const match = nameWithoutExtension.match(SEASON_REGEX);
+		const match = stem.match(SEASON_REGEX);
+		const groups = match!.groups!;
 		return [
 			{
 				t: "tvsearch",
-				q: cleanseSeparators(match!.groups!.title),
-				season: extractNumber(match!.groups!.season),
+				q: useIds ? undefined : cleanseSeparators(groups.title),
+				season: extractInt(groups.season),
+				...relevantIds,
 			},
 		] as const;
+	} else if (mediaType === MediaType.MOVIE && caps.movieSearch) {
+		return [
+			{
+				t: "movie",
+				q: useIds ? undefined : reformatTitleForSearching(stem),
+				...relevantIds,
+			},
+		] as const;
+	}
+	if (useIds && caps.tvSearch && parsedMedia?.series) {
+		const eps = parsedMedia.episodes;
+		const season = eps.length > 0 ? eps[0].seasonNumber : undefined;
+		const ep = eps.length === 1 ? eps[0].episodeNumber : undefined;
+		return [
+			{ t: "tvsearch", q: undefined, season, ep, ...relevantIds },
+		] as const;
+	} else if (useIds && caps.movieSearch && parsedMedia?.movie) {
+		return [{ t: "movie", q: undefined, ...relevantIds }] as const;
 	} else if (mediaType === MediaType.ANIME) {
-		const animeQueries = getAnimeQueries(nameWithoutExtension);
-		return animeQueries.map((animeQuery) => ({
+		return getAnimeQueries(stem).map((animeQuery) => ({
 			t: "search",
 			q: animeQuery,
 		}));
@@ -149,74 +250,72 @@ function createTorznabSearchQueries(
 		return [
 			{
 				t: "search",
-				q: reformatTitleForSearching(nameWithoutExtension),
+				q: reformatTitleForSearching(stem),
 			},
 		] as const;
+	}
+}
+
+export function indexerDoesSupportMediaType(
+	mediaType: MediaType,
+	caps: TorznabCats,
+) {
+	switch (mediaType) {
+		case MediaType.EPISODE:
+		case MediaType.SEASON:
+			return caps.tv;
+		case MediaType.MOVIE: // Should get most anime movies
+			return caps.movie;
+		case MediaType.ANIME: // All? indexers support anime (sometimes no cat)
+			return caps.anime || caps.tv || caps.movie;
+		case MediaType.AUDIO:
+			return caps.audio;
+		case MediaType.BOOK:
+			return caps.book;
+		case MediaType.OTHER:
+			return true;
 	}
 }
 
 export async function queryRssFeeds(): Promise<Candidate[]> {
 	const candidatesByUrl = await makeRequests(
 		await getEnabledIndexers(),
-		() => [{ t: "search", q: "" }],
+		async () => [{ t: "search", q: "" }],
 	);
 	return candidatesByUrl.flatMap((e) => e.candidates);
 }
 
 export async function searchTorznab(
 	searchee: Searchee,
+	progress: string,
 ): Promise<{ indexerId: number; candidates: Candidate[] }[]> {
-	const { excludeRecentSearch, excludeOlder, torznab } = getRuntimeConfig();
+	const { torznab } = getRuntimeConfig();
 	if (torznab.length === 0) {
 		throw new Error("no indexers are available");
 	}
-	const enabledIndexers = await getEnabledIndexers();
 
-	const name = searchee.name;
-
-	// search history for name across all indexers
-	const timestampDataSql = await db("searchee")
-		.join("timestamp", "searchee.id", "timestamp.searchee_id")
-		.join("indexer", "timestamp.indexer_id", "indexer.id")
-		.whereIn(
-			"indexer.id",
-			enabledIndexers.map((i) => i.id),
-		)
-		.andWhere({ name })
-		.select({
-			indexerId: "indexer.id",
-			firstSearched: "timestamp.first_searched",
-			lastSearched: "timestamp.last_searched",
-		});
-	const indexersToUse = enabledIndexers.filter((indexer) => {
-		const entry = timestampDataSql.find(
-			(entry) => entry.indexerId === indexer.id,
-		);
-		return (
-			!entry ||
-			((!excludeOlder || entry.firstSearched > nMsAgo(excludeOlder)) &&
-				(!excludeRecentSearch ||
-					entry.lastSearched < nMsAgo(excludeRecentSearch)))
-		);
-	});
-
-	const timestampCallout = " (filtered by timestamps)";
-	logger.info({
-		label: Label.TORZNAB,
-		message: `Searching ${indexersToUse.length} indexers for ${name}${
-			indexersToUse.length < enabledIndexers.length
-				? timestampCallout
-				: ""
-		}`,
-	});
-
-	return makeRequests(indexersToUse, (indexer) =>
-		createTorznabSearchQueries(searchee, {
+	const mediaType = getMediaType(searchee);
+	const { indexersToUse, parsedMedia } = await getAndLogIndexers(
+		searchee,
+		mediaType,
+		progress,
+	);
+	return await makeRequests(indexersToUse, async (indexer) => {
+		const caps = {
 			search: indexer.searchCap,
 			tvSearch: indexer.tvSearchCap,
 			movieSearch: indexer.movieSearchCap,
-		}),
-	);
+			tvIdSearch: JSON.parse(indexer.tvIdCaps),
+			movieIdSearch: JSON.parse(indexer.movieIdCaps),
+			categories: JSON.parse(indexer.categories),
+		};
+		return await createTorznabSearchQueries(
+			searchee,
+			mediaType,
+			caps,
+			parsedMedia,
+		);
+	});
 }
 
 export async function syncWithDb() {
@@ -233,7 +332,10 @@ export async function syncWithDb() {
 			retryAfter: "retry_after",
 			searchCap: "search_cap",
 			tvSearchCap: "tv_search_cap",
+			tvIdCaps: "tv_id_caps",
 			movieSearchCap: "movie_search_cap",
+			movieIdCaps: "movie_id_caps",
+			categories: "cat_caps",
 		});
 
 	const inConfigButNotInDb = torznab.filter(
@@ -304,10 +406,10 @@ export async function syncWithDb() {
 	});
 }
 
-function assembleUrl(
+export function assembleUrl(
 	urlStr: string,
 	apikey: string,
-	params: TorznabParams,
+	params: TorznabParams | IdSearchParams,
 ): string {
 	const url = new URL(urlStr);
 	const searchParams = new URLSearchParams();
@@ -336,7 +438,7 @@ async function fetchCaps(indexer: {
 		const error = new Error(
 			`Indexer ${indexer.url} failed to respond, check verbose logs`,
 		);
-		logger.error(error);
+		logger.error(error.message);
 		logger.debug(e);
 		throw error;
 	}
@@ -346,7 +448,7 @@ async function fetchCaps(indexer: {
 		const error = new Error(
 			`Indexer ${indexer.url} responded with code ${response.status} when fetching caps, check verbose logs`,
 		);
-		logger.error(error);
+		logger.error(error.message);
 		logger.debug(
 			`Response body first 1000 characters: ${responseText.substring(
 				0,
@@ -362,7 +464,7 @@ async function fetchCaps(indexer: {
 		const error = new Error(
 			`Indexer ${indexer.url} responded with invalid XML when fetching caps, check verbose logs`,
 		);
-		logger.error(error);
+		logger.error(error.message);
 		logger.debug(
 			`Response body first 1000 characters: ${responseText.substring(
 				0,
@@ -396,9 +498,8 @@ function collateOutcomes<Correlator, SuccessReturnType>(
 	);
 }
 
-async function updateCaps(
-	indexers: { id: number; url: string; apikey: string }[],
-): Promise<void> {
+export async function updateCaps(): Promise<void> {
+	const indexers = await getAllIndexers();
 	const outcomes = await Promise.allSettled<Caps>(
 		indexers.map((indexer) => fetchCaps(indexer)),
 	);
@@ -406,13 +507,17 @@ async function updateCaps(
 		indexers.map((i) => i.id),
 		outcomes,
 	);
-
 	for (const [indexerId, caps] of fulfilled) {
-		await db("indexer").where({ id: indexerId }).update({
-			search_cap: caps.search,
-			tv_search_cap: caps.tvSearch,
-			movie_search_cap: caps.movieSearch,
-		});
+		await db("indexer")
+			.where({ id: indexerId })
+			.update({
+				search_cap: caps.search,
+				tv_search_cap: caps.tvSearch,
+				movie_search_cap: caps.movieSearch,
+				movie_id_caps: JSON.stringify(caps.movieIdSearch),
+				tv_id_caps: JSON.stringify(caps.tvIdSearch),
+				cat_caps: JSON.stringify(caps.categories),
+			});
 	}
 }
 
@@ -434,16 +539,7 @@ export async function validateTorznabUrls() {
 		}
 	}
 	await syncWithDb();
-	const enabledIndexersWithoutCaps = await db("indexer")
-		.where({
-			active: true,
-			search_cap: null,
-			tv_search_cap: null,
-			movie_search_cap: null,
-		})
-		.orWhere({ search_cap: false, active: true })
-		.select({ id: "id", url: "url", apikey: "apikey" });
-	await updateCaps(enabledIndexersWithoutCaps);
+	await updateCaps(); // Refresh every indexer's caps
 
 	const indexersWithoutSearch = await db("indexer")
 		.where({ search_cap: false, active: true })
@@ -464,14 +560,16 @@ export async function validateTorznabUrls() {
 
 async function makeRequests(
 	indexers: Indexer[],
-	getQueries: (indexer: Indexer) => TorznabParams[],
+	getQueries: (indexer: Indexer) => Promise<TorznabParams[]>,
 ): Promise<{ indexerId: number; candidates: Candidate[] }[]> {
 	const { searchTimeout } = getRuntimeConfig();
-	const searchUrls = indexers.flatMap((indexer: Indexer) =>
-		getQueries(indexer).map((query) =>
-			assembleUrl(indexer.url, indexer.apikey, query),
+	const searchUrls = await Promise.all(
+		indexers.flatMap(async (indexer: Indexer) =>
+			(await getQueries(indexer)).map((query) =>
+				assembleUrl(indexer.url, indexer.apikey, query),
+			),
 		),
-	);
+	).then((urls) => urls.flat());
 	searchUrls.forEach(
 		(message) => void logger.verbose({ label: Label.TORZNAB, message }),
 	);
@@ -542,4 +640,86 @@ async function makeRequests(
 		indexerId,
 		candidates: results,
 	}));
+}
+async function getAndLogIndexers(
+	searchee: Searchee,
+	mediaType: MediaType,
+	progress: string,
+): Promise<{ indexersToUse: Indexer[]; parsedMedia?: ParsedMedia }> {
+	const { excludeRecentSearch, excludeOlder } = getRuntimeConfig();
+	const searcheeLog = getLogString(searchee, chalk.bold.white);
+	const mediaTypeLog = chalk.white(mediaType.toUpperCase());
+
+	const enabledIndexers = await getEnabledIndexers();
+
+	// search history for name across all indexers
+	const name = searchee.name;
+	const timestampDataSql = await db("searchee")
+		.join("timestamp", "searchee.id", "timestamp.searchee_id")
+		.join("indexer", "timestamp.indexer_id", "indexer.id")
+		.whereIn(
+			"indexer.id",
+			enabledIndexers.map((i) => i.id),
+		)
+		.andWhere({ name })
+		.select({
+			indexerId: "indexer.id",
+			firstSearched: "timestamp.first_searched",
+			lastSearched: "timestamp.last_searched",
+		});
+
+	const skipBefore = excludeOlder
+		? nMsAgo(excludeOlder)
+		: Number.NEGATIVE_INFINITY;
+	const skipAfter = excludeRecentSearch
+		? nMsAgo(excludeRecentSearch)
+		: Number.POSITIVE_INFINITY;
+	const timeFilteredIndexers = enabledIndexers.filter((indexer) => {
+		const entry = timestampDataSql.find(
+			(entry) => entry.indexerId === indexer.id,
+		);
+		if (!entry) return true;
+		if (entry.firstSearched < skipBefore) return false;
+		if (entry.lastSearched > skipAfter) return false;
+		return true;
+	});
+
+	const indexersToUse = timeFilteredIndexers.filter((indexer) => {
+		return indexerDoesSupportMediaType(
+			mediaType,
+			JSON.parse(indexer.categories),
+		);
+	});
+
+	const filteringCauses = [
+		enabledIndexers.length > timeFilteredIndexers.length && "timestamps",
+		timeFilteredIndexers.length > indexersToUse.length && "category",
+	].filter(isTruthy);
+	const reasonStr = filteringCauses.length
+		? ` (filtered by ${formatAsList(filteringCauses)})`
+		: "";
+	if (indexersToUse.length === 0) {
+		logger.info({
+			label: searchee.label,
+			message: `${progress}Skipped searching on indexers for ${searcheeLog}${reasonStr} | MediaType: ${mediaTypeLog} | IDs: N/A`,
+		});
+		return { indexersToUse };
+	}
+
+	// Parse media from arrs
+	const res = await scanAllArrsForMedia(searchee, mediaType);
+	const parsedMedia = res.isOk() ? res.unwrap() : undefined;
+	const ids = parsedMedia?.movie ?? parsedMedia?.series;
+	const idsStr = ids ? formatFoundIds(ids) : "NONE";
+
+	logger.info({
+		label: searchee.label,
+		message: `${progress}Searching for ${searcheeLog} | MediaType: ${mediaTypeLog} | IDs: ${idsStr}`,
+	});
+	logger.verbose({
+		label: Label.TORZNAB,
+		message: `Using ${indexersToUse.length} indexers for ${searcheeLog}${reasonStr}`,
+	});
+
+	return { indexersToUse, parsedMedia };
 }

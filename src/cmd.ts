@@ -8,6 +8,7 @@ import {
 	Action,
 	LinkType,
 	MatchMode,
+	NEWLINE_INDENT,
 	PROGRAM_NAME,
 	PROGRAM_VERSION,
 } from "./constants.js";
@@ -73,8 +74,8 @@ export async function validateAndSetRuntimeConfig(options: RuntimeConfig) {
 			logger.error(
 				`${
 					path.length > 0 ? `Option: ${optionLine}` : "Configuration:"
-				}\n\t\t\t\t${message}\n\t\t\t\t(https://www.cross-seed.org/docs/basics/options${
-					urlPath ? `#${urlPath}` : ""
+				}${NEWLINE_INDENT}${message}${NEWLINE_INDENT}(https://www.cross-seed.org/docs/basics/options${
+					urlPath ? `#${urlPath.toLowerCase()}` : ""
 				})\n`,
 			);
 		});
@@ -121,9 +122,9 @@ function createCommandWithSharedOptions(name: string, description: string) {
 				.makeOptionMandatory(),
 		)
 		.option(
-			"--linking-category <cat>",
+			"--link-category <cat>",
 			"Torrent client category to set on linked torrents",
-			fallback(fileConfig.linkingCategory, "cross-seed-link"),
+			fallback(fileConfig.linkCategory, "cross-seed-link"),
 		)
 		.option(
 			"--link-dir <dir>",
@@ -143,11 +144,6 @@ function createCommandWithSharedOptions(name: string, description: string) {
 				.default(fallback(fileConfig.linkType, LinkType.SYMLINK))
 				.choices(Object.values(LinkType))
 				.makeOptionMandatory(),
-		)
-		.option(
-			"--skip-recheck",
-			"Skips torrent recheck upon adding to QBittorrent",
-			fallback(fileConfig.skipRecheck, false),
 		)
 		.option(
 			"--max-data-depth <depth>",
@@ -259,14 +255,26 @@ function createCommandWithSharedOptions(name: string, description: string) {
 		.option(
 			"--search-limit <number>",
 			"The number of searches before stops",
-			parseInt,
+			(n) => parseInt(n),
 			fallback(fileConfig.searchLimit, 0),
 		)
 		.option(
-			"--block-list <strings>",
+			"--block-list <strings...>",
 			"The infohashes and/or strings in torrent name to block from cross-seed",
 			// @ts-expect-error commander supports non-string defaults
 			fallback(fileConfig.blockList, []),
+		)
+		.option(
+			"--sonarr <urls...>",
+			"Sonarr API URL(s)",
+			// @ts-expect-error commander supports non-string defaults
+			fileConfig.sonarr,
+		)
+		.option(
+			"--radarr <urls...>",
+			"Radarr API URL(s)",
+			// @ts-expect-error commander supports non-string defaults
+			fileConfig.radarr,
 		);
 }
 

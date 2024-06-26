@@ -1,4 +1,5 @@
 import { join } from "path";
+import stripAnsi from "strip-ansi";
 import winston from "winston";
 import DailyRotateFile from "winston-daily-rotate-file";
 import { appDir, createAppDir } from "./configuration.js";
@@ -18,8 +19,12 @@ export enum Label {
 	SCHEDULER = "scheduler",
 	SEARCH = "search",
 	RSS = "rss",
+	ANNOUNCE = "announce",
+	WEBHOOK = "webhook",
 	PERF = "perf",
-	REVERSE_LOOKUP = "reverselookup",
+	ARRS = "arrs",
+	RADARR = "radarr",
+	SONARR = "sonarr",
 }
 
 export let logger: winston.Logger;
@@ -43,15 +48,20 @@ function redactUrlPassword(message, urlStr) {
 	return message;
 }
 
-function redactMessage(message: string | unknown, options?) {
+function redactMessage(message: string | unknown, options?: RuntimeConfig) {
 	if (typeof message !== "string") {
 		return message;
 	}
 	const runtimeConfig = options ?? getRuntimeConfig();
 	let ret = message;
 
-	// redact torznab api keys
-	ret = ret.replace(/apikey=[a-zA-Z0-9]+/g, `apikey=${redactionMsg}`);
+	ret = ret.replace(/key=[a-zA-Z0-9]+/g, `key=${redactionMsg}`);
+	ret = ret.replace(/pass=[a-zA-Z0-9]+/g, `pass=${redactionMsg}`);
+	ret = ret.replace(/(?:auto\.\d+\.)([a-zA-Z0-9]+)/g, (match, key) =>
+		match.replace(key, redactionMsg),
+	);
+	ret = ret.replace(/apiKey: '.+'/g, `apiKey: ${redactionMsg}`);
+
 	ret = ret.replace(
 		/\/notification\/crossSeed\/[a-zA-Z-0-9_-]+/g,
 		`/notification/crossSeed/${redactionMsg}`,
@@ -62,6 +72,13 @@ function redactMessage(message: string | unknown, options?) {
 		}
 	}
 	return ret;
+}
+
+function stripAnsiChars(message: string | unknown) {
+	if (typeof message !== "string") {
+		return message;
+	}
+	return stripAnsi(message);
 }
 
 const logOnceCache: string[] = [];
@@ -82,12 +99,13 @@ export function initializeLogger(options: RuntimeConfig): void {
 			}),
 			winston.format.errors({ stack: true }),
 			winston.format.splat(),
-			winston.format.colorize(),
-			winston.format.printf(({ level, message, label, timestamp }) => {
-				return `${timestamp} ${level}: ${
-					label ? `[${label}] ` : ""
-				}${redactMessage(message, options)}`;
-			}),
+			winston.format.printf(
+				({ level, message, label, timestamp, stack }) => {
+					return `${timestamp} ${level}: ${
+						label ? `[${label}] ` : ""
+					}${stripAnsiChars(redactMessage(stack ? stack : message, options))}`;
+				},
+			),
 		),
 		transports: [
 			new DailyRotateFile({

@@ -1,8 +1,8 @@
 import ms from "ms";
-import { sep } from "path";
 import { ErrorMapCtx, RefinementCtx, z, ZodIssueOptionalMessage } from "zod";
-import { Action, LinkType, MatchMode } from "./constants.js";
+import { Action, LinkType, MatchMode, NEWLINE_INDENT } from "./constants.js";
 import { logger } from "./logger.js";
+import { resolve, relative, isAbsolute } from "path";
 
 /**
  * error messages and map returned upon Zod validation failure
@@ -11,17 +11,17 @@ const ZodErrorMessages = {
 	vercel: "format does not follow vercel's `ms` style ( https://github.com/vercel/ms#examples )",
 	emptyString:
 		"cannot have an empty string. If you want to unset it, use null or undefined.",
-	delay: "delay is in seconds, you can't travel back in time.",
+	delayNegative: "delay is in seconds, you can't travel back in time.",
+	delayTooHigh: `delay over 1hr is not supported.${NEWLINE_INDENT}To even out search loads please see the following documentation:${NEWLINE_INDENT}(https://www.cross-seed.org/docs/basics/daemon#set-up-periodic-searches)`,
 	fuzzySizeThreshold: "fuzzySizeThreshold must be between 0 and 1.",
 	injectUrl:
 		"You need to specify rtorrentRpcUrl, transmissionRpcUrl, qbittorrentUrl, or delugeRpcUrl when using 'inject'",
-	recheckWarn:
-		"It is strongly recommended to not skip rechecking for risky or partial matching mode.",
-	windowsPath: `Your path is not formatted properly for Windows. Please use "\\\\" or "/" for directory separators.`,
-	qBitFlatLinking:
-		"Using Automatic Torrent Management in qBittorrent without flatLinking enabled can result in injection path failures.",
+	qBitAutoTMM:
+		"If using Automatic Torrent Management in qBittorrent, please read: https://www.cross-seed.org/docs/v6-migration#qbittorrent",
 	needsLinkDir:
-		"You need to set a linkDir for risky or partial matching to work.",
+		"You need to set a linkDir (and have your data accessible) for risky or partial matching to work.",
+	linkDirInDataDir:
+		"You cannot have your linkDir inside of your dataDirs. Please adjust your paths to correct this.",
 };
 
 /**
@@ -81,14 +81,19 @@ function transformDurationString(durationStr: string, ctx: RefinementCtx) {
 }
 
 /**
- * helper function for directory validation
- * @return path if valid formatting
+ * check a potential child path being inside a array of parent paths
+ * @param linkDir path of the potential child (linkDir)
+ * @param dataDirs array of dataDir paths
+ * @returns true if `linkDir` is inside any dataDir at any nesting level, false otherwise.
  */
-function checkValidPathFormat(path: string, ctx: RefinementCtx) {
-	if (sep === "\\" && !path.includes("\\") && !path.includes("/")) {
-		addZodIssue(path, ZodErrorMessages.windowsPath, ctx);
-	}
-	return path;
+function isChildPath(linkDir: string, dataDirs: string[]): boolean {
+	return dataDirs.some((datadir) => {
+		const resolvedParent = resolve(datadir);
+		const resolvedChild = resolve(linkDir);
+		const relativePath = relative(resolvedParent, resolvedChild);
+		// if the path does not start with '..' and is not absolute
+		return !(relativePath.startsWith("..") || isAbsolute(relativePath));
+	});
 }
 
 /**
@@ -98,33 +103,24 @@ function checkValidPathFormat(path: string, ctx: RefinementCtx) {
 
 export const VALIDATION_SCHEMA = z
 	.object({
-		delay: z.number().nonnegative({
-			message: ZodErrorMessages.delay,
-		}),
+		delay: z
+			.number()
+			.nonnegative({
+				message: ZodErrorMessages.delayNegative,
+			})
+			.lte(3600, ZodErrorMessages.delayTooHigh),
 		torznab: z.array(z.string().url()),
-		dataDirs: z
-			.array(
-				z
-					.string()
-					.transform((value, ctx) =>
-						value && value.length > 0
-							? checkValidPathFormat(value, ctx)
-							: null,
-					),
-			)
-
-			.nullish(),
+		dataDirs: z.array(z.string()).nullish(),
 		matchMode: z.nativeEnum(MatchMode),
-		linkingCategory: z.string().nullish(),
-		linkDir: z.string().transform(checkValidPathFormat).nullish(),
+		linkCategory: z.string().nullish(),
+		linkDir: z.string().nullish(),
 		linkType: z.nativeEnum(LinkType),
 		flatLinking: z
 			.boolean()
 			.nullish()
 			.transform((value) => (typeof value === "boolean" ? value : false)),
-		skipRecheck: z.boolean(),
 		maxDataDepth: z.number().gte(1),
-		torrentDir: z.string().nullish(),
+		torrentDir: z.string().nullable(),
 		outputDir: z.string(),
 		includeEpisodes: z.boolean(),
 		includeSingleEpisodes: z.boolean(),
@@ -184,6 +180,14 @@ export const VALIDATION_SCHEMA = z
 			.nullish()
 			.transform((value) => (Array.isArray(value) ? value : [])),
 		apiKey: z.string().min(24).nullish(),
+		radarr: z
+			.array(z.string().url())
+			.nullish()
+			.transform((value) => value ?? []),
+		sonarr: z
+			.array(z.string().url())
+			.nullish()
+			.transform((value) => value ?? []),
 	})
 	.strict()
 	.refine((config) => {
@@ -193,7 +197,7 @@ export const VALIDATION_SCHEMA = z
 			!config.flatLinking &&
 			config.linkDir
 		) {
-			logger.warn(ZodErrorMessages.qBitFlatLinking);
+			logger.warn(ZodErrorMessages.qBitAutoTMM);
 		}
 		return true;
 	})
@@ -208,13 +212,13 @@ export const VALIDATION_SCHEMA = z
 			),
 		ZodErrorMessages.injectUrl,
 	)
-	.refine((config) => {
-		if (config.skipRecheck && config.matchMode !== MatchMode.SAFE) {
-			logger.warn(ZodErrorMessages.recheckWarn);
-		}
-		return true;
-	})
 	.refine(
 		(config) => config.matchMode === MatchMode.SAFE || config.linkDir,
 		ZodErrorMessages.needsLinkDir,
-	);
+	)
+	.refine((config) => {
+		if (config.linkDir && config.dataDirs) {
+			return !isChildPath(config.linkDir, config.dataDirs);
+		}
+		return true;
+	}, ZodErrorMessages.linkDirInDataDir);

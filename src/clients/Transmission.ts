@@ -1,11 +1,15 @@
-import { Decision, InjectionResult, TORRENT_TAG } from "../constants.js";
+import {
+	DecisionAnyMatch,
+	InjectionResult,
+	TORRENT_TAG,
+} from "../constants.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import { Searchee, SearcheeWithInfoHash } from "../searchee.js";
-import { extractCredentialsFromUrl } from "../utils.js";
+import { shouldRecheck, extractCredentialsFromUrl } from "../utils.js";
 import { TorrentClient } from "./TorrentClient.js";
 
 const XTransmissionSessionId = "X-Transmission-Session-Id";
@@ -88,7 +92,7 @@ export default class Transmission implements TorrentClient {
 				);
 			}
 		} catch (e) {
-			if (e instanceof TypeError) {
+			if (e instanceof SyntaxError) {
 				logger.error({
 					label: Label.TRANSMISSION,
 					message: `Transmission returned non-JSON response`,
@@ -168,14 +172,9 @@ export default class Transmission implements TorrentClient {
 	async inject(
 		newTorrent: Metafile,
 		searchee: Searchee,
-		decision:
-			| Decision.MATCH
-			| Decision.MATCH_SIZE_ONLY
-			| Decision.MATCH_PARTIAL,
+		decision: DecisionAnyMatch,
 		path?: string,
 	): Promise<InjectionResult> {
-		const { skipRecheck } = getRuntimeConfig();
-
 		let downloadDir: string;
 		if (path) {
 			downloadDir = path;
@@ -186,14 +185,11 @@ export default class Transmission implements TorrentClient {
 			if (result.isErr()) {
 				return InjectionResult.FAILURE;
 			} else {
-				downloadDir = result.unwrapOrThrow();
+				downloadDir = result.unwrap();
 			}
 		}
 
 		let addResponse: TorrentAddResponse;
-
-		const skipRecheckTorrent =
-			decision === Decision.MATCH_PARTIAL ? skipRecheck : true;
 
 		try {
 			addResponse = await this.request<TorrentAddResponse>(
@@ -201,7 +197,7 @@ export default class Transmission implements TorrentClient {
 				{
 					"download-dir": downloadDir,
 					metainfo: newTorrent.encode().toString("base64"),
-					paused: !skipRecheckTorrent,
+					paused: shouldRecheck(decision),
 					labels: [TORRENT_TAG],
 				},
 			);

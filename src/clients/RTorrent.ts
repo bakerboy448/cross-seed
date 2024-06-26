@@ -3,14 +3,18 @@ import { stat, unlink, writeFile } from "fs/promises";
 import { dirname, join, resolve, sep } from "path";
 import { inspect } from "util";
 import xmlrpc, { Client } from "xmlrpc";
-import { Decision, InjectionResult, TORRENT_TAG } from "../constants.js";
+import {
+	DecisionAnyMatch,
+	InjectionResult,
+	TORRENT_TAG,
+} from "../constants.js";
 import { CrossSeedError } from "../errors.js";
 import { Label, logger } from "../logger.js";
 import { Metafile } from "../parseTorrent.js";
 import { Result, resultOf, resultOfErr } from "../Result.js";
 import { getRuntimeConfig } from "../runtimeConfig.js";
 import { File, Searchee, SearcheeWithInfoHash } from "../searchee.js";
-import { extractCredentialsFromUrl, wait } from "../utils.js";
+import { shouldRecheck, extractCredentialsFromUrl, wait } from "../utils.js";
 import { TorrentClient } from "./TorrentClient.js";
 
 const COULD_NOT_FIND_INFO_HASH = "Could not find info-hash.";
@@ -276,13 +280,10 @@ export default class RTorrent implements TorrentClient {
 	async inject(
 		meta: Metafile,
 		searchee: Searchee,
-		decision:
-			| Decision.MATCH
-			| Decision.MATCH_SIZE_ONLY
-			| Decision.MATCH_PARTIAL,
+		decision: DecisionAnyMatch,
 		path?: string,
 	): Promise<InjectionResult> {
-		const { outputDir, skipRecheck } = getRuntimeConfig();
+		const { outputDir } = getRuntimeConfig();
 
 		if (await this.checkForInfoHashInClient(meta.infoHash)) {
 			return InjectionResult.ALREADY_EXISTS;
@@ -290,7 +291,7 @@ export default class RTorrent implements TorrentClient {
 
 		const result = await this.getDownloadLocation(meta, searchee, path);
 		if (result.isErr()) {
-			switch (result.unwrapErrOrThrow()) {
+			switch (result.unwrapErr()) {
 				case "NOT_FOUND":
 					return InjectionResult.FAILURE;
 				case "TORRENT_NOT_COMPLETE":
@@ -299,7 +300,7 @@ export default class RTorrent implements TorrentClient {
 					return InjectionResult.FAILURE;
 			}
 		}
-		const { directoryBase, basePath } = result.unwrapOrThrow();
+		const { directoryBase, basePath } = result.unwrap();
 
 		const torrentFilePath = resolve(
 			outputDir,
@@ -308,12 +309,7 @@ export default class RTorrent implements TorrentClient {
 
 		await saveWithLibTorrentResume(meta, torrentFilePath, basePath);
 
-		const loadType =
-			decision === Decision.MATCH_PARTIAL
-				? skipRecheck
-					? "load.start"
-					: "load"
-				: "load.start";
+		const loadType = shouldRecheck(decision) ? "load" : "load.start";
 
 		for (let i = 0; i < 5; i++) {
 			try {

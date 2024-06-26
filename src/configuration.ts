@@ -26,9 +26,8 @@ export interface FileConfig {
 	linkDir?: string;
 	linkType?: string;
 	flatLinking?: boolean;
-	skipRecheck?: boolean;
 	maxDataDepth?: number;
-	linkingCategory?: string;
+	linkCategory?: string;
 	torrentDir?: string;
 	torznab?: string[];
 	qbittorrentUrl?: string;
@@ -45,6 +44,8 @@ export interface FileConfig {
 	searchLimit?: number;
 	blockList?: string[];
 	apiKey?: string;
+	sonarr?: string[];
+	radarr?: string[];
 }
 
 export const UNPARSABLE_CONFIG_MESSAGE = `
