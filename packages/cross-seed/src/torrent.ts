@@ -87,6 +87,25 @@ interface TorrentEntry {
 	file_path?: string;
 }
 
+function isRecoverableTorrentDirError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as NodeJS.ErrnoException).code;
+	return ["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(code ?? "");
+}
+
+function logRecoverableTorrentDirError(
+	torrentDir: string,
+	error: unknown,
+): void {
+	const message =
+		error instanceof Error ? error.message : String(error ?? "");
+	logger.warn({
+		label: Label.INDEX,
+		message: `Skipping torrentDir indexing for "${torrentDir}": ${message}`,
+	});
+	logger.debug(error);
+}
+
 export interface EnsembleEntry {
 	client_host: string | null;
 	path: string;
@@ -455,7 +474,13 @@ async function indexTorrents(options: { startup: boolean }): Promise<void> {
 				label: Label.INDEX,
 				message: "Indexing torrentDir for reverse lookup...",
 			});
-			searchees = await loadTorrentDirLight(torrentDir);
+			try {
+				searchees = await loadTorrentDirLight(torrentDir);
+			} catch (error) {
+				if (!isRecoverableTorrentDirError(error)) throw error;
+				logRecoverableTorrentDirError(torrentDir, error);
+				searchees = [];
+			}
 			if (clients.length) {
 				infoHashPathMap = await clients[0].getAllDownloadDirs({
 					metas: searchees,
@@ -486,7 +511,13 @@ async function indexTorrents(options: { startup: boolean }): Promise<void> {
 		}
 	} else {
 		if (torrentDir) {
-			searchees = await indexTorrentDir(torrentDir);
+			try {
+				searchees = await indexTorrentDir(torrentDir);
+			} catch (error) {
+				if (!isRecoverableTorrentDirError(error)) throw error;
+				logRecoverableTorrentDirError(torrentDir, error);
+				searchees = [];
+			}
 		} else {
 			searchees = await flatMapAsync(clients, async (client) => {
 				try {
