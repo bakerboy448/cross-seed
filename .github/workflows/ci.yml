@@ -130,6 +130,7 @@ jobs:
                   username: ${{ github.repository_owner }}
                   password: ${{ secrets.GITHUB_TOKEN }}
             - name: Login to DockerHub
+              if: github.repository == 'cross-seed/cross-seed'
               uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
               with:
                   username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -139,11 +140,15 @@ jobs:
               env:
                   TAGS: ${{ needs.docker-meta.outputs.tags }}
                   SUFFIX: ${{ matrix.suffix }}
+                  UPSTREAM: ${{ github.repository == 'cross-seed/cross-seed' }}
               run: |
                   set -euo pipefail
                   tags=""
                   while IFS= read -r tag; do
                       [ -z "$tag" ] && continue
+                      if [ "$UPSTREAM" != "true" ] && [[ "$tag" != ghcr.io/* ]]; then
+                          continue
+                      fi
                       tags="${tags}${tag}${SUFFIX}"$'\n'
                   done <<< "$TAGS"
                   tags="${tags%$'\n'}"
@@ -169,6 +174,23 @@ jobs:
                       echo "EOF"
                   } >> "$GITHUB_OUTPUT"
                   echo "build_date=$(git log -1 --pretty=%cI)" >> "$GITHUB_OUTPUT"
+            - name: Set temp image tags
+              id: temp-tags
+              env:
+                  UPSTREAM: ${{ github.repository == 'cross-seed/cross-seed' }}
+                  TEMP_GHCR:
+                      ghcr.io/${{ github.repository_owner }}/cross-seed:ci-${{
+                      github.sha }}-${{ matrix.arch }}
+                  TEMP_DH:
+                      crossseed/cross-seed:ci-${{ github.sha }}-${{ matrix.arch
+                      }}
+              run: |
+                  set -euo pipefail
+                  tags="$TEMP_GHCR"
+                  if [ "$UPSTREAM" = "true" ]; then
+                      tags="${tags}"$'\n'"${TEMP_DH}"
+                  fi
+                  printf 'tags<<EOF\n%s\nEOF\n' "$tags" >> "$GITHUB_OUTPUT"
             - name: Build and push temp image (${{ matrix.arch }})
               uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
               with:
@@ -180,9 +202,7 @@ jobs:
                       BUILD_TAG=${{ steps.build-args.outputs.build_tag }}
                       BUILD_MESSAGE=${{ steps.build-args.outputs.build_message }}
                       BUILD_DATE=${{ steps.build-args.outputs.build_date }}
-                  tags: |
-                      ghcr.io/${{ github.repository_owner }}/cross-seed:ci-${{ github.sha }}-${{ matrix.arch }}
-                      crossseed/cross-seed:ci-${{ github.sha }}-${{ matrix.arch }}
+                  tags: ${{ steps.temp-tags.outputs.tags }}
                   labels: ${{ needs.docker-meta.outputs.labels }}
             - name: Smoke test image (${{ matrix.arch }})
               run:
@@ -226,6 +246,7 @@ jobs:
                   username: ${{ github.repository_owner }}
                   password: ${{ secrets.GITHUB_TOKEN }}
             - name: Login to DockerHub
+              if: github.repository == 'cross-seed/cross-seed'
               uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
               with:
                   username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -233,9 +254,13 @@ jobs:
             - name: Create multi-architecture manifests
               env:
                   TAGS: ${{ needs.docker-meta.outputs.tags }}
+                  UPSTREAM: ${{ github.repository == 'cross-seed/cross-seed' }}
               run: |
                   set -euo pipefail
                   while IFS= read -r tag; do
                       [ -z "$tag" ] && continue
+                      if [ "$UPSTREAM" != "true" ] && [[ "$tag" != ghcr.io/* ]]; then
+                          continue
+                      fi
                       docker buildx imagetools create --tag "${tag}" "${tag}-amd64" "${tag}-arm64"
                   done <<< "$TAGS"
